@@ -31,6 +31,7 @@ public class Main {
                 ChatCompletionCreateParams.builder()
                         .model("anthropic/claude-haiku-4.5")
                         .addUserMessage(prompt)
+                        .addTool(ReadFileTool.class)
                         .build()
         );
 
