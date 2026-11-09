@@ -8,5 +8,4 @@ public class ReadFileTool {
     @JsonPropertyDescription("The path to the file to read")
     @JsonProperty("file_path")
     public String filePath;
-    
 }
