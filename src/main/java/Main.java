@@ -3,11 +3,14 @@ import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.core.JsonValue;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 
 import java.util.Map;
 import java.util.List;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 
 public class Main {
     public static void main(String[] args) {
@@ -33,61 +36,72 @@ public class Main {
                 .baseUrl(baseUrl)
                 .build();
 
-        ChatCompletion response = client.chat().completions().create(
-    ChatCompletionCreateParams.builder()
-        .model("anthropic/claude-haiku-4.5")
-        .addUserMessage(prompt)
-        .putAdditionalBodyProperty(
-            "tools",
-            JsonValue.from(
-                List.of(
-                    Map.of(
-                        "type", "function",
-                        "function", Map.of(
-                            "name", "Read",
-                            "description", "Read and return the contents of a file",
-                            "parameters", Map.of(
-                                "type", "object",
-                                "properties", Map.of(
-                                    "file_path", Map.of(
-                                        "type", "string",
-                                        "description", "The path to the file to read"
-                                    )
-                                ),
-                                "required", List.of("file_path")
-                            )
-                        )
-                    )
-                )
-            )
-        )
-        .build()
-);
-        if (response.choices().isEmpty()) {
-            throw new RuntimeException("no choices in response");
-        }
+        List<ChatCompletionMessageParam> messages = new ArrayList<>();
+        messages.add(ChatCompletionMessageParam.ofUser(
+                com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
+                        .content(prompt)
+                        .build()));
 
-        var message = response.choices().get(0).message();
-        var toolCalls = message.toolCalls();
-        if (toolCalls.isPresent() && !toolCalls.get().isEmpty()) {
-            var toolCall = toolCalls.get().get(0);
-            if (!toolCall.isFunction()) {
-                throw new RuntimeException("unsupported tool call type");
+        while (true) {
+            ChatCompletion response = client.chat().completions().create(
+                    ChatCompletionCreateParams.builder()
+                            .model("anthropic/claude-haiku-4.5")
+                            .messages(messages)
+                            .putAdditionalBodyProperty(
+                                    "tools",
+                                    JsonValue.from(
+                                            List.of(
+                                                    Map.of(
+                                                            "type", "function",
+                                                            "function", Map.of(
+                                                                    "name", "Read",
+                                                                    "description", "Read and return the contents of a file",
+                                                                    "parameters", Map.of(
+                                                                            "type", "object",
+                                                                            "properties", Map.of(
+                                                                                    "file_path", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "The path to the file to read")),
+                                                                            "required", List.of("file_path")))))))
+                            .build());
+            if (response.choices().isEmpty()) {
+                throw new RuntimeException("no choices in response");
             }
 
-            var function = toolCall.asFunction().function();
-            if (!"Read".equals(function.name())) {
-                throw new RuntimeException("unsupported tool: " + function.name());
+            var message = response.choices().get(0).message();
+            messages.add(ChatCompletionMessageParam.ofAssistant(message.toParam()));
+
+            var toolCalls = message.toolCalls();
+            if (toolCalls.isEmpty() || toolCalls.get().isEmpty()) {
+                System.out.print(message.content().orElse(""));
+                return;
             }
 
-            ReadFileTool arguments = function.arguments(ReadFileTool.class);
-            try {
-                System.out.print(Files.readString(Path.of(arguments.filePath)));
-            } catch (java.io.IOException e) {
-                throw new RuntimeException("failed to read file: " + arguments.filePath, e);
+            for (var toolCall : toolCalls.get()) {
+                if (!toolCall.isFunction()) {
+                    throw new RuntimeException("unsupported tool call type");
+                }
+
+                var functionCall = toolCall.asFunction();
+                var function = functionCall.function();
+                String result;
+                if ("Read".equals(function.name())) {
+                    ReadFileTool arguments = function.arguments(ReadFileTool.class);
+                    try {
+                        result = Files.readString(Path.of(arguments.filePath));
+                    } catch (java.io.IOException e) {
+                        throw new RuntimeException("failed to read file: " + arguments.filePath, e);
+                    }
+                } else {
+                    throw new RuntimeException("unsupported tool: " + function.name());
+                }
+
+                messages.add(ChatCompletionMessageParam.ofTool(
+                        ChatCompletionToolMessageParam.builder()
+                                .toolCallId(functionCall.id())
+                                .content(result)
+                                .build()));
             }
-        } else {
-            System.out.print(message.content().orElse(""));
         }
     }
 }
