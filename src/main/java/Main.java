@@ -15,6 +15,8 @@ import java.util.ArrayList;
 import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
 import java.util.stream.Stream;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Main {
     public static void main(String[] args) {
@@ -281,6 +283,7 @@ public class Main {
             }
         }
         String skillName = whitespace >= 0 ? command.substring(0, whitespace) : command;
+        String arguments = whitespace >= 0 ? command.substring(whitespace).strip() : "";
         if (skillName.isEmpty()) {
             return prompt;
         }
@@ -302,9 +305,39 @@ public class Main {
             if (frontmatterEnd < 0) {
                 throw new RuntimeException("skill has invalid frontmatter: " + skillName);
             }
-            return String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
+            String body = String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
+            return substituteSkillArguments(body, arguments);
         } catch (java.io.IOException e) {
             throw new RuntimeException("failed to load skill: " + skillName, e);
+        }
+    }
+
+    private static String substituteSkillArguments(String body, String arguments) {
+        String[] positionalArguments = arguments.isBlank() ? new String[0] : arguments.split("\\s+");
+        Pattern placeholderPattern = Pattern.compile("\\$ARGUMENTS(?:\\[(\\d+)\\])?|\\$(\\d+)");
+        Matcher matcher = placeholderPattern.matcher(body);
+        StringBuffer substituted = new StringBuffer();
+        while (matcher.find()) {
+            String replacement;
+            if (matcher.group(1) != null) {
+                replacement = positionalArgument(positionalArguments, matcher.group(1));
+            } else if (matcher.group(2) != null) {
+                replacement = positionalArgument(positionalArguments, matcher.group(2));
+            } else {
+                replacement = arguments;
+            }
+            matcher.appendReplacement(substituted, Matcher.quoteReplacement(replacement));
+        }
+        matcher.appendTail(substituted);
+        return substituted.toString();
+    }
+
+    private static String positionalArgument(String[] arguments, String indexText) {
+        try {
+            int index = Integer.parseInt(indexText);
+            return index >= 0 && index < arguments.length ? arguments[index] : "";
+        } catch (NumberFormatException e) {
+            return "";
         }
     }
 
