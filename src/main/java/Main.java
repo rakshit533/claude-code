@@ -11,6 +11,7 @@ import java.util.List;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 
 public class Main {
     public static void main(String[] args) {
@@ -77,7 +78,19 @@ public class Main {
                                                                                     "content", Map.of(
                                                                                             "type", "string",
                                                                                             "description", "The content to write to the file")),
-                                                                            "required", List.of("file_path", "content")))))))
+                                                                            "required", List.of("file_path", "content")))),
+                                                    Map.of(
+                                                            "type", "function",
+                                                            "function", Map.of(
+                                                                    "name", "Bash",
+                                                                    "description", "Execute a shell command",
+                                                                    "parameters", Map.of(
+                                                                            "type", "object",
+                                                                            "properties", Map.of(
+                                                                                    "command", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "The command to execute")),
+                                                                            "required", List.of("command")))))))
                             .build());
             if (response.choices().isEmpty()) {
                 throw new RuntimeException("no choices in response");
@@ -120,6 +133,9 @@ public class Main {
                     } catch (java.io.IOException e) {
                         throw new RuntimeException("failed to write file: " + arguments.filePath, e);
                     }
+                } else if ("Bash".equals(function.name())) {
+                    BashTool arguments = function.arguments(BashTool.class);
+                    result = executeBash(arguments.command);
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
@@ -130,6 +146,26 @@ public class Main {
                                 .content(result)
                                 .build()));
             }
+        }
+    }
+
+    private static String executeBash(String command) {
+        try {
+            Process process = new ProcessBuilder("bash", "-c", command)
+                    .directory(Path.of("").toAbsolutePath().toFile())
+                    .redirectErrorStream(true)
+                    .start();
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                return output;
+            }
+            return "Command failed with exit code " + exitCode + ".\n" + output;
+        } catch (java.io.IOException e) {
+            return "Failed to execute command: " + e.getMessage();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "Command execution was interrupted.";
         }
     }
 }
