@@ -62,7 +62,22 @@ public class Main {
                                                                                     "file_path", Map.of(
                                                                                             "type", "string",
                                                                                             "description", "The path to the file to read")),
-                                                                            "required", List.of("file_path")))))))
+                                                                            "required", List.of("file_path")))),
+                                                    Map.of(
+                                                            "type", "function",
+                                                            "function", Map.of(
+                                                                    "name", "Write",
+                                                                    "description", "Write content to a file",
+                                                                    "parameters", Map.of(
+                                                                            "type", "object",
+                                                                            "properties", Map.of(
+                                                                                    "file_path", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "The path of the file to write to"),
+                                                                                    "content", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "The content to write to the file")),
+                                                                            "required", List.of("file_path", "content")))))))
                             .build());
             if (response.choices().isEmpty()) {
                 throw new RuntimeException("no choices in response");
@@ -91,6 +106,19 @@ public class Main {
                         result = Files.readString(Path.of(arguments.filePath));
                     } catch (java.io.IOException e) {
                         throw new RuntimeException("failed to read file: " + arguments.filePath, e);
+                    }
+                } else if ("Write".equals(function.name())) {
+                    WriteFileTool arguments = function.arguments(WriteFileTool.class);
+                    Path filePath = Path.of(arguments.filePath);
+                    try {
+                        Path parent = filePath.getParent();
+                        if (parent != null) {
+                            Files.createDirectories(parent);
+                        }
+                        Files.writeString(filePath, arguments.content);
+                        result = "File written successfully.";
+                    } catch (java.io.IOException e) {
+                        throw new RuntimeException("failed to write file: " + arguments.filePath, e);
                     }
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
