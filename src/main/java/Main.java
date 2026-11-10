@@ -6,6 +6,8 @@ import com.openai.models.chat.completions.ChatCompletionCreateParams;
 
 import java.util.Map;
 import java.util.List;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 public class Main {
     public static void main(String[] args) {
@@ -65,11 +67,27 @@ public class Main {
             throw new RuntimeException("no choices in response");
         }
 
-        // You can use print statements as follows for debugging, they'll be visible
-        // when running tests.
-        System.err.println("Logs from your program will appear here!");
+        var message = response.choices().get(0).message();
+        var toolCalls = message.toolCalls();
+        if (toolCalls.isPresent() && !toolCalls.get().isEmpty()) {
+            var toolCall = toolCalls.get().get(0);
+            if (!toolCall.isFunction()) {
+                throw new RuntimeException("unsupported tool call type");
+            }
 
-        // TODO: Uncomment the line below to pass the first stage
-        System.out.print(response.choices().get(0).message().content().orElse(""));
+            var function = toolCall.asFunction().function();
+            if (!"Read".equals(function.name())) {
+                throw new RuntimeException("unsupported tool: " + function.name());
+            }
+
+            ReadFileTool arguments = function.arguments(ReadFileTool.class);
+            try {
+                System.out.print(Files.readString(Path.of(arguments.filePath)));
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("failed to read file: " + arguments.filePath, e);
+            }
+        } else {
+            System.out.print(message.content().orElse(""));
+        }
     }
 }
