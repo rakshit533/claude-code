@@ -4,6 +4,7 @@ import com.openai.core.JsonValue;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionSystemMessageParam;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 
 import java.util.Map;
@@ -12,6 +13,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.nio.charset.StandardCharsets;
+import java.util.Comparator;
+import java.util.stream.Stream;
 
 public class Main {
     public static void main(String[] args) {
@@ -38,6 +41,13 @@ public class Main {
                 .build();
 
         List<ChatCompletionMessageParam> messages = new ArrayList<>();
+        String skillsPrompt = loadSkillsPrompt();
+        if (skillsPrompt != null) {
+            messages.add(ChatCompletionMessageParam.ofSystem(
+                    ChatCompletionSystemMessageParam.builder()
+                            .content(skillsPrompt)
+                            .build()));
+        }
         messages.add(ChatCompletionMessageParam.ofUser(
                 com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
                         .content(prompt)
@@ -167,5 +177,120 @@ public class Main {
             Thread.currentThread().interrupt();
             return "Command execution was interrupted.";
         }
+    }
+
+    private static String loadSkillsPrompt() {
+        Path skillsDirectory = Path.of(".claude", "skills");
+        if (!Files.isDirectory(skillsDirectory)) {
+            return null;
+        }
+
+        List<String> skillDescriptions = new ArrayList<>();
+        try (Stream<Path> skillFolders = Files.list(skillsDirectory)) {
+            for (Path skillFolder : skillFolders.filter(Files::isDirectory).sorted(Comparator.comparing(Path::toString)).toList()) {
+                Path skillFile = skillFolder.resolve("SKILL.md");
+                if (!Files.isRegularFile(skillFile)) {
+                    continue;
+                }
+
+                Map<String, String> metadata = parseSkillFrontmatter(Files.readAllLines(skillFile, StandardCharsets.UTF_8));
+                String name = metadata.get("name");
+                String description = metadata.get("description");
+                if (name != null && !name.isBlank() && description != null && !description.isBlank()) {
+                    skillDescriptions.add("- " + name + ": " + description);
+                }
+            }
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("failed to load skills", e);
+        }
+
+        if (skillDescriptions.isEmpty()) {
+            return null;
+        }
+        return "You have access to the following skills:\n\n"
+                + String.join("\n", skillDescriptions)
+                + "\n";
+    }
+
+    private static Map<String, String> parseSkillFrontmatter(List<String> lines) {
+        Map<String, String> metadata = new java.util.HashMap<>();
+        if (lines.isEmpty() || !lines.get(0).strip().equals("---")) {
+            return metadata;
+        }
+
+        int frontmatterEnd = 1;
+        while (frontmatterEnd < lines.size() && !lines.get(frontmatterEnd).strip().equals("---")) {
+            frontmatterEnd++;
+        }
+
+        for (int i = 1; i < frontmatterEnd; i++) {
+            String line = lines.get(i);
+            if (line.isBlank() || Character.isWhitespace(line.charAt(0))) {
+                continue;
+            }
+
+            int colon = line.indexOf(':');
+            if (colon <= 0) {
+                continue;
+            }
+
+            String key = line.substring(0, colon).trim();
+            if (!key.equals("name") && !key.equals("description")) {
+                continue;
+            }
+
+            String value = line.substring(colon + 1).trim();
+            if (key.equals("description") && value.matches("[|>][+-]?") ) {
+                boolean folded = value.startsWith(">");
+                List<String> contentLines = new ArrayList<>();
+                int j = i + 1;
+                while (j < frontmatterEnd && (lines.get(j).isBlank() || Character.isWhitespace(lines.get(j).charAt(0)))) {
+                    contentLines.add(lines.get(j));
+                    j++;
+                }
+                value = parseBlockScalar(contentLines, folded);
+                i = j - 1;
+            } else if (key.equals("description") && value.isEmpty()) {
+                List<String> contentLines = new ArrayList<>();
+                int j = i + 1;
+                while (j < frontmatterEnd && (lines.get(j).isBlank() || Character.isWhitespace(lines.get(j).charAt(0)))) {
+                    contentLines.add(lines.get(j));
+                    j++;
+                }
+                value = String.join(" ", contentLines.stream().map(String::trim).filter(s -> !s.isEmpty()).toList());
+                i = j - 1;
+            } else {
+                value = parseScalar(value);
+            }
+            metadata.put(key, value);
+        }
+        return metadata;
+    }
+
+    private static String parseBlockScalar(List<String> lines, boolean folded) {
+        int indentation = lines.stream()
+                .filter(line -> !line.isBlank())
+                .mapToInt(line -> line.length() - line.stripLeading().length())
+                .min()
+                .orElse(0);
+        List<String> values = lines.stream()
+                .map(line -> line.isBlank() ? "" : line.substring(Math.min(indentation, line.length())))
+                .toList();
+        String separator = folded ? " " : "\n";
+        return String.join(separator, values).trim();
+    }
+
+    private static String parseScalar(String value) {
+        if (value.length() >= 2 && value.startsWith("'") && value.endsWith("'")) {
+            return value.substring(1, value.length() - 1).replace("''", "'");
+        }
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            return value.substring(1, value.length() - 1)
+                    .replace("\\n", "\n")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\");
+        }
+        int comment = value.indexOf(" #");
+        return comment >= 0 ? value.substring(0, comment).trim() : value;
     }
 }
