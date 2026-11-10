@@ -50,7 +50,7 @@ public class Main {
         }
         messages.add(ChatCompletionMessageParam.ofUser(
                 com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
-                        .content(prompt)
+                        .content(resolveSkillPrompt(prompt))
                         .build()));
 
         while (true) {
@@ -218,9 +218,9 @@ public class Main {
             return metadata;
         }
 
-        int frontmatterEnd = 1;
-        while (frontmatterEnd < lines.size() && !lines.get(frontmatterEnd).strip().equals("---")) {
-            frontmatterEnd++;
+        int frontmatterEnd = findFrontmatterEnd(lines);
+        if (frontmatterEnd < 0) {
+            return metadata;
         }
 
         for (int i = 1; i < frontmatterEnd; i++) {
@@ -265,6 +265,59 @@ public class Main {
             metadata.put(key, value);
         }
         return metadata;
+    }
+
+    private static String resolveSkillPrompt(String prompt) {
+        if (!prompt.startsWith("/")) {
+            return prompt;
+        }
+
+        String command = prompt.substring(1);
+        int whitespace = -1;
+        for (int i = 0; i < command.length(); i++) {
+            if (Character.isWhitespace(command.charAt(i))) {
+                whitespace = i;
+                break;
+            }
+        }
+        String skillName = whitespace >= 0 ? command.substring(0, whitespace) : command;
+        if (skillName.isEmpty()) {
+            return prompt;
+        }
+
+        Path skillsDirectory = Path.of(".claude", "skills").toAbsolutePath().normalize();
+        Path skillDirectory = skillsDirectory.resolve(skillName).normalize();
+        if (!skillDirectory.startsWith(skillsDirectory)) {
+            throw new RuntimeException("invalid skill name: " + skillName);
+        }
+
+        Path skillFile = skillDirectory.resolve("SKILL.md");
+        if (!Files.isRegularFile(skillFile)) {
+            throw new RuntimeException("skill not found: " + skillName);
+        }
+
+        try {
+            List<String> lines = Files.readAllLines(skillFile, StandardCharsets.UTF_8);
+            int frontmatterEnd = findFrontmatterEnd(lines);
+            if (frontmatterEnd < 0) {
+                throw new RuntimeException("skill has invalid frontmatter: " + skillName);
+            }
+            return String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("failed to load skill: " + skillName, e);
+        }
+    }
+
+    private static int findFrontmatterEnd(List<String> lines) {
+        if (lines.isEmpty() || !lines.get(0).strip().equals("---")) {
+            return -1;
+        }
+        for (int i = 1; i < lines.size(); i++) {
+            if (lines.get(i).strip().equals("---")) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static String parseBlockScalar(List<String> lines, boolean folded) {
