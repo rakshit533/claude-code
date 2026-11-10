@@ -50,10 +50,7 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        messages.add(ChatCompletionMessageParam.ofUser(
-                com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
-                        .content(resolveSkillPrompt(prompt))
-                        .build()));
+        addUserMessages(messages, prompt);
 
         while (true) {
             ChatCompletion response = client.chat().completions().create(
@@ -269,44 +266,66 @@ public class Main {
         return metadata;
     }
 
-    private static String resolveSkillPrompt(String prompt) {
+    private static void addUserMessages(List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
-            return prompt;
-        }
-
-        String command = prompt.substring(1);
-        int whitespace = -1;
-        for (int i = 0; i < command.length(); i++) {
-            if (Character.isWhitespace(command.charAt(i))) {
-                whitespace = i;
-                break;
-            }
-        }
-        String skillName = whitespace >= 0 ? command.substring(0, whitespace) : command;
-        String arguments = whitespace >= 0 ? command.substring(whitespace).strip() : "";
-        if (skillName.isEmpty()) {
-            return prompt;
+            addUserMessage(messages, prompt);
+            return;
         }
 
         Path skillsDirectory = Path.of(".claude", "skills").toAbsolutePath().normalize();
-        Path skillDirectory = skillsDirectory.resolve(skillName).normalize();
-        if (!skillDirectory.startsWith(skillsDirectory)) {
-            throw new RuntimeException("invalid skill name: " + skillName);
+        List<String> skillBodies = new ArrayList<>();
+        String arguments = "";
+        Matcher tokens = Pattern.compile("\\S+").matcher(prompt);
+        while (tokens.find()) {
+            String token = tokens.group();
+            if (!token.startsWith("/") || token.length() == 1) {
+                arguments = prompt.substring(tokens.start());
+                break;
+            }
+
+            String skillName = token.substring(1);
+            if (skillName.contains("/") || skillName.contains("\\")) {
+                arguments = prompt.substring(tokens.start());
+                break;
+            }
+
+            Path skillDirectory = skillsDirectory.resolve(skillName).normalize();
+            if (!skillDirectory.startsWith(skillsDirectory)) {
+                arguments = prompt.substring(tokens.start());
+                break;
+            }
+            Path skillFile = skillDirectory.resolve("SKILL.md");
+            if (!Files.isRegularFile(skillFile)) {
+                arguments = prompt.substring(tokens.start());
+                break;
+            }
+            skillBodies.add(loadSkillBody(skillFile, skillName));
         }
 
-        Path skillFile = skillDirectory.resolve("SKILL.md");
-        if (!Files.isRegularFile(skillFile)) {
-            throw new RuntimeException("skill not found: " + skillName);
+        if (skillBodies.isEmpty()) {
+            addUserMessage(messages, prompt);
+            return;
         }
+        for (String body : skillBodies) {
+            addUserMessage(messages, substituteSkillArguments(body, arguments));
+        }
+    }
 
+    private static void addUserMessage(List<ChatCompletionMessageParam> messages, String content) {
+        messages.add(ChatCompletionMessageParam.ofUser(
+                com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
+                        .content(content)
+                        .build()));
+    }
+
+    private static String loadSkillBody(Path skillFile, String skillName) {
         try {
             List<String> lines = Files.readAllLines(skillFile, StandardCharsets.UTF_8);
             int frontmatterEnd = findFrontmatterEnd(lines);
             if (frontmatterEnd < 0) {
                 throw new RuntimeException("skill has invalid frontmatter: " + skillName);
             }
-            String body = String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
-            return substituteSkillArguments(body, arguments);
+            return String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
         } catch (java.io.IOException e) {
             throw new RuntimeException("failed to load skill: " + skillName, e);
         }
