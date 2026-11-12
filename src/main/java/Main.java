@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -211,13 +212,13 @@ public class Main {
                     "type", "function",
                     "function", Map.of(
                             "name", "LSP",
-                            "description", "Returns the file, line, and character where a symbol is defined. Line and character are 1-based.",
+                            "description", "Finds a symbol's definition or references. Line and character inputs are 1-based.",
                             "parameters", Map.of(
                                     "type", "object",
                                     "properties", Map.of(
                                             "operation", Map.of(
                                                     "type", "string",
-                                                    "enum", List.of("goToDefinition")),
+                                                    "enum", List.of("goToDefinition", "findReferences")),
                                             "filePath", Map.of(
                                                     "type", "string",
                                                     "description", "Absolute path, or a path relative to the agent's current working directory."),
@@ -238,7 +239,7 @@ public class Main {
         if (lspClient == null) {
             return "LSP is not configured";
         }
-        if (!"goToDefinition".equals(arguments.operation)) {
+        if (!"goToDefinition".equals(arguments.operation) && !"findReferences".equals(arguments.operation)) {
             return "Unsupported LSP operation: " + arguments.operation;
         }
 
@@ -266,23 +267,69 @@ public class Main {
             openedDocuments.add(sourceUri);
         }
 
-        Map<String, Object> definitionRequest = Map.of(
-                "method", "textDocument/definition",
-                "params", Map.of(
-                        "textDocument", Map.of("uri", sourceUri),
-                        "position", Map.of(
-                                "line", arguments.line - 1,
-                                "character", arguments.character - 1)));
-        String response = lspClient.call("request", JSON_MAPPER.writeValueAsString(definitionRequest));
-        JsonNode location = JSON_MAPPER.readTree(response);
-        Path targetPath = Path.of(URI.create(location.get("uri").asText())).toAbsolutePath().normalize();
+        Map<String, Object> textDocument = Map.of("uri", sourceUri);
+        Map<String, Object> position = Map.of(
+                "line", arguments.line - 1,
+                "character", arguments.character - 1);
+        Map<String, Object> params = "findReferences".equals(arguments.operation)
+                ? Map.of(
+                        "textDocument", textDocument,
+                        "position", position,
+                        "context", Map.of("includeDeclaration", true))
+                : Map.of("textDocument", textDocument, "position", position);
+        Map<String, Object> request = Map.of(
+                "method", "goToDefinition".equals(arguments.operation)
+                        ? "textDocument/definition"
+                        : "textDocument/references",
+                "params", params);
+        String response = lspClient.call("request", JSON_MAPPER.writeValueAsString(request));
+        JsonNode result = JSON_MAPPER.readTree(response);
+        if ("goToDefinition".equals(arguments.operation)) {
+            return formatDefinitionResult(result);
+        }
+        return formatReferencesResult(result);
+    }
+
+    private static String formatDefinitionResult(JsonNode location) {
+        String relativePath = relativePathFromUri(location.get("uri").asText());
         JsonNode start = location.path("range").path("start");
-        String relativePath = Path.of("").toAbsolutePath().normalize()
+        return "Defined in " + relativePath + ":" + (start.get("line").asInt() + 1)
+                + ":" + (start.get("character").asInt() + 1);
+    }
+
+    private static String formatReferencesResult(JsonNode locations) {
+        if (!locations.isArray() || locations.size() == 0) {
+            return "No references found.";
+        }
+
+        Map<String, List<String>> referencesByFile = new LinkedHashMap<>();
+        for (JsonNode location : locations) {
+            String relativePath = relativePathFromUri(location.path("uri").asText());
+            JsonNode start = location.path("range").path("start");
+            String position = "  Line " + (start.get("line").asInt() + 1)
+                    + ":" + (start.get("character").asInt() + 1);
+            referencesByFile.computeIfAbsent(relativePath, ignored -> new ArrayList<>()).add(position);
+        }
+
+        int referenceCount = locations.size();
+        int fileCount = referencesByFile.size();
+        StringBuilder formatted = new StringBuilder()
+                .append("Found ").append(referenceCount).append(referenceCount == 1 ? " reference" : " references")
+                .append(" across ").append(fileCount).append(fileCount == 1 ? " file:\n\n" : " files:\n\n");
+        referencesByFile.forEach((file, positions) -> {
+            formatted.append(file).append(':').append('\n');
+            positions.forEach(position -> formatted.append(position).append('\n'));
+            formatted.append('\n');
+        });
+        return formatted.toString().stripTrailing();
+    }
+
+    private static String relativePathFromUri(String uri) {
+        Path targetPath = Path.of(URI.create(uri)).toAbsolutePath().normalize();
+        return Path.of("").toAbsolutePath().normalize()
                 .relativize(targetPath)
                 .toString()
                 .replace('\\', '/');
-        return "Defined in " + relativePath + ":" + (start.get("line").asInt() + 1)
-                + ":" + (start.get("character").asInt() + 1);
     }
 
     private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, SkillTool arguments) {
