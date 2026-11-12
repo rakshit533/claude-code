@@ -115,7 +115,11 @@ public class Main {
                             ? diagnosticTracker.takeNewDiagnostics()
                             : "";
                     if (!diagnostics.isEmpty()) {
-                        addUserMessage(messages, diagnostics);
+                        if (latestToolResult.canAppendDiagnostics()) {
+                            latestToolResult.appendDiagnostics(messages, diagnostics);
+                        } else {
+                            addUserMessage(messages, diagnostics);
+                        }
                         continue;
                     }
                 } catch (Exception e) {
@@ -135,11 +139,7 @@ public class Main {
                 boolean isWrite = "Write".equals(function.name());
                 if ("Read".equals(function.name())) {
                     ReadFileTool arguments = function.arguments(ReadFileTool.class);
-                    try {
-                        result = Files.readString(Path.of(arguments.filePath));
-                    } catch (java.io.IOException e) {
-                        throw new RuntimeException("failed to read file: " + arguments.filePath, e);
-                    }
+                    result = readFile(arguments.filePath);
                 } else if ("Write".equals(function.name())) {
                     WriteFileTool arguments = function.arguments(WriteFileTool.class);
                     Path filePath = Path.of(arguments.filePath);
@@ -188,17 +188,21 @@ public class Main {
         private int messageIndex = -1;
         private String toolCallId;
         private String content;
-        private boolean writeResult;
 
         private void record(int messageIndex, String toolCallId, String content, boolean writeResult) {
+            // A Write result must remain the plain success message. Keep the
+            // most recent other tool result as the carrier for diagnostics
+            // that arrive asynchronously after a Write.
+            if (writeResult) {
+                return;
+            }
             this.messageIndex = messageIndex;
             this.toolCallId = toolCallId;
             this.content = content;
-            this.writeResult = writeResult;
         }
 
         private boolean canAppendDiagnostics() {
-            return messageIndex >= 0 && !writeResult;
+            return messageIndex >= 0;
         }
 
         private void appendDiagnostics(List<ChatCompletionMessageParam> messages, String diagnostics) {
@@ -627,6 +631,24 @@ public class Main {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return "Command execution was interrupted.";
+        }
+    }
+
+    private static String readFile(String filePath) {
+        try {
+            Path path = Path.of(filePath);
+            if (Files.isDirectory(path)) {
+                try (Stream<Path> entries = Files.list(path)) {
+                    List<String> names = entries
+                            .map(entry -> entry.getFileName().toString())
+                            .sorted()
+                            .toList();
+                    return String.join("\n", names);
+                }
+            }
+            return Files.readString(path);
+        } catch (Exception e) {
+            return "Failed to read '" + filePath + "': " + e.getMessage();
         }
     }
 
