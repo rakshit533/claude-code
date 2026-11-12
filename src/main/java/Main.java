@@ -12,6 +12,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.Map;
 import java.util.List;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.LinkedHashMap;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +27,7 @@ import java.util.regex.Pattern;
 
 public class Main {
     private record SkillDocument(String body, Map<String, String> metadata) {}
+    private record DiagnosticEntry(String uri, String key, String relativePath, int line, int character, Integer severity, String message) {}
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     public static void main(String[] args) {
@@ -62,6 +65,7 @@ public class Main {
 
         List<ChatCompletionMessageParam> messages = new ArrayList<>();
         Map<String, Integer> lspDocumentVersions = new HashMap<>();
+        DiagnosticTracker diagnosticTracker = new DiagnosticTracker(lspClient, lspDocumentVersions);
         String skillsPrompt = loadSkillsPrompt();
         if (skillsPrompt != null) {
             messages.add(ChatCompletionMessageParam.ofSystem(
@@ -69,11 +73,14 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        addUserMessages(client, lspClient, lspDocumentVersions, messages, prompt);
-        System.out.print(runAgentLoop(client, lspClient, lspDocumentVersions, messages));
+        if (lspClient != null) {
+            addSystemMessage(messages, "Use the LSP tool to find definitions and references. Treat <new-diagnostics> reports returned by tools as feedback and use them to repair affected code.");
+        }
+        addUserMessages(client, lspClient, lspDocumentVersions, diagnosticTracker, messages, prompt);
+        System.out.print(runAgentLoop(client, lspClient, lspDocumentVersions, diagnosticTracker, messages));
     }
 
-    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, List<ChatCompletionMessageParam> messages) {
+    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, DiagnosticTracker diagnosticTracker, List<ChatCompletionMessageParam> messages) {
         while (true) {
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
@@ -92,6 +99,16 @@ public class Main {
 
             var toolCalls = message.toolCalls();
             if (toolCalls.isEmpty() || toolCalls.get().isEmpty()) {
+                try {
+                    diagnosticTracker.poll();
+                    String diagnostics = diagnosticTracker.takeNewDiagnostics();
+                    if (!diagnostics.isEmpty()) {
+                        addUserMessage(messages, diagnostics);
+                        continue;
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException("failed to read LSP diagnostics", e);
+                }
                 return message.content().orElse("");
             }
 
@@ -103,6 +120,7 @@ public class Main {
                 var functionCall = toolCall.asFunction();
                 var function = functionCall.function();
                 String result;
+                boolean isWrite = "Write".equals(function.name());
                 if ("Read".equals(function.name())) {
                     ReadFileTool arguments = function.arguments(ReadFileTool.class);
                     try {
@@ -131,7 +149,7 @@ public class Main {
                     result = executeBash(arguments.command);
                 } else if ("Skill".equals(function.name())) {
                     SkillTool arguments = function.arguments(SkillTool.class);
-                    result = invokeSkill(client, lspClient, lspDocumentVersions, arguments);
+                    result = invokeSkill(client, lspClient, lspDocumentVersions, diagnosticTracker, arguments);
                 } else if ("LSP".equals(function.name())) {
                     LSPTool arguments = function.arguments(LSPTool.class);
                     try {
@@ -141,6 +159,18 @@ public class Main {
                     }
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
+                }
+
+                try {
+                    diagnosticTracker.poll();
+                    if (!isWrite) {
+                        String diagnostics = diagnosticTracker.takeNewDiagnostics();
+                        if (!diagnostics.isEmpty()) {
+                            result += "\n\n" + diagnostics;
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException("failed to read LSP diagnostics", e);
                 }
 
                 messages.add(ChatCompletionMessageParam.ofTool(
@@ -390,7 +420,146 @@ public class Main {
                 .replace('\\', '/');
     }
 
-    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, SkillTool arguments) {
+    private static final class DiagnosticTracker {
+        private final LSPClient lspClient;
+        private final Map<String, Integer> documentVersions;
+        private final Map<String, Integer> lastReportVersions = new HashMap<>();
+        private final Map<String, List<DiagnosticEntry>> latestReports = new HashMap<>();
+        private final Map<String, Set<String>> shownKeys = new HashMap<>();
+        private final Map<String, List<DiagnosticEntry>> pending = new LinkedHashMap<>();
+        private long cursor;
+
+        private DiagnosticTracker(LSPClient lspClient, Map<String, Integer> documentVersions) {
+            this.lspClient = lspClient;
+            this.documentVersions = documentVersions;
+        }
+
+        private void poll() throws Exception {
+            if (lspClient == null) {
+                return;
+            }
+
+            String payload = JSON_MAPPER.writeValueAsString(Map.of("after", cursor, "timeoutMs", 0));
+            JsonNode batch = JSON_MAPPER.readTree(lspClient.call("notifications", payload));
+            if (batch.has("cursor")) {
+                cursor = batch.path("cursor").asLong(cursor);
+            }
+
+            JsonNode notifications = batch.path("notifications");
+            if (!notifications.isArray()) {
+                return;
+            }
+            for (JsonNode notification : notifications) {
+                if ("textDocument/publishDiagnostics".equals(notification.path("method").asText())) {
+                    acceptReport(notification.path("params"));
+                }
+            }
+        }
+
+        private void acceptReport(JsonNode params) {
+            String uri = URI.create(params.path("uri").asText()).normalize().toASCIIString();
+            Integer reportVersion = params.hasNonNull("version") ? params.path("version").asInt() : null;
+            Integer documentVersion = documentVersions.get(uri);
+            Integer previousReportVersion = lastReportVersions.get(uri);
+            if (reportVersion != null) {
+                if (documentVersion != null && reportVersion < documentVersion) {
+                    return;
+                }
+                if (documentVersion == null && previousReportVersion != null && reportVersion < previousReportVersion) {
+                    return;
+                }
+                lastReportVersions.put(uri, reportVersion);
+            }
+
+            List<DiagnosticEntry> current = new ArrayList<>();
+            JsonNode diagnostics = params.path("diagnostics");
+            if (diagnostics.isArray()) {
+                Set<String> reportKeys = new HashSet<>();
+                for (JsonNode diagnostic : diagnostics) {
+                    JsonNode range = diagnostic.path("range");
+                    JsonNode start = range.path("start");
+                    int line = start.path("line").asInt();
+                    int character = start.path("character").asInt();
+                    int endLine = range.path("end").path("line").asInt(line);
+                    int endCharacter = range.path("end").path("character").asInt(character);
+                    Integer severity = diagnostic.hasNonNull("severity") ? diagnostic.path("severity").asInt() : null;
+                    String message = diagnostic.path("message").asText();
+                    String key = line + ":" + character + ":" + endLine + ":" + endCharacter
+                            + ":" + severity + ":" + message;
+                    if (reportKeys.add(key)) {
+                        current.add(new DiagnosticEntry(uri, key, relativePathFromUri(uri), line, character, severity, message));
+                    }
+                }
+            }
+
+            latestReports.put(uri, current);
+            Set<String> alreadyShown = shownKeys.computeIfAbsent(uri, ignored -> new HashSet<>());
+            Set<String> currentKeys = new HashSet<>();
+            current.forEach(diagnostic -> currentKeys.add(diagnostic.key()));
+            alreadyShown.retainAll(currentKeys);
+
+            List<DiagnosticEntry> newDiagnostics = current.stream()
+                    .filter(diagnostic -> !alreadyShown.contains(diagnostic.key()))
+                    .toList();
+            if (newDiagnostics.isEmpty()) {
+                pending.remove(uri);
+            } else {
+                pending.put(uri, new ArrayList<>(newDiagnostics));
+            }
+            if (current.isEmpty()) {
+                shownKeys.put(uri, new HashSet<>());
+            }
+        }
+
+        private String takeNewDiagnostics() {
+            if (pending.isEmpty()) {
+                return "";
+            }
+
+            Map<String, List<DiagnosticEntry>> byFile = new LinkedHashMap<>();
+            for (List<DiagnosticEntry> diagnostics : pending.values()) {
+                for (DiagnosticEntry diagnostic : diagnostics) {
+                    byFile.computeIfAbsent(diagnostic.relativePath(), ignored -> new ArrayList<>()).add(diagnostic);
+                }
+            }
+
+            StringBuilder output = new StringBuilder(
+                    "<new-diagnostics>The following new diagnostic issues were detected:\n\n");
+            byFile.forEach((file, diagnostics) -> {
+                output.append(file).append(':').append('\n');
+                for (DiagnosticEntry diagnostic : diagnostics) {
+                    output.append("  [Line ").append(diagnostic.line() + 1).append(':')
+                            .append(diagnostic.character() + 1).append(']');
+                    if (diagnostic.severity() != null) {
+                        output.append(" [").append(severityName(diagnostic.severity())).append(']');
+                    }
+                    output.append(' ').append(diagnostic.message()).append('\n');
+                }
+                output.append('\n');
+            });
+            output.append("</new-diagnostics>");
+
+            for (String uri : pending.keySet()) {
+                Set<String> currentKeys = new HashSet<>();
+                latestReports.getOrDefault(uri, List.of()).forEach(diagnostic -> currentKeys.add(diagnostic.key()));
+                shownKeys.put(uri, currentKeys);
+            }
+            pending.clear();
+            return output.toString();
+        }
+
+        private static String severityName(int severity) {
+            return switch (severity) {
+                case 1 -> "Error";
+                case 2 -> "Warning";
+                case 3 -> "Information";
+                case 4 -> "Hint";
+                default -> "Severity " + severity;
+            };
+        }
+    }
+
+    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, DiagnosticTracker diagnosticTracker, SkillTool arguments) {
         Path skillFile = findSkillFile(arguments.name);
         if (skillFile == null) {
             return "Skill not found: " + arguments.name;
@@ -404,7 +573,7 @@ public class Main {
 
         List<ChatCompletionMessageParam> subagentMessages = new ArrayList<>();
         addUserMessage(subagentMessages, body);
-        String answer = runAgentLoop(client, lspClient, lspDocumentVersions, subagentMessages);
+        String answer = runAgentLoop(client, lspClient, lspDocumentVersions, diagnosticTracker, subagentMessages);
         return "Skill " + arguments.name + " ran in a separate context and returned: " + answer;
     }
 
@@ -517,7 +686,7 @@ public class Main {
         return metadata;
     }
 
-    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, List<ChatCompletionMessageParam> messages, String prompt) {
+    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, DiagnosticTracker diagnosticTracker, List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
             addUserMessage(messages, prompt);
             return;
@@ -555,7 +724,7 @@ public class Main {
                 SkillTool forkArguments = new SkillTool();
                 forkArguments.name = skillName;
                 forkArguments.args = prompt.substring(tokens.end()).strip();
-                addUserMessage(messages, invokeSkill(client, lspClient, lspDocumentVersions, forkArguments));
+                addUserMessage(messages, invokeSkill(client, lspClient, lspDocumentVersions, diagnosticTracker, forkArguments));
                 return;
             }
             skillBodies.add(skill.body());
@@ -573,6 +742,13 @@ public class Main {
     private static void addUserMessage(List<ChatCompletionMessageParam> messages, String content) {
         messages.add(ChatCompletionMessageParam.ofUser(
                 com.openai.models.chat.completions.ChatCompletionUserMessageParam.builder()
+                        .content(content)
+                        .build()));
+    }
+
+    private static void addSystemMessage(List<ChatCompletionMessageParam> messages, String content) {
+        messages.add(ChatCompletionMessageParam.ofSystem(
+                ChatCompletionSystemMessageParam.builder()
                         .content(content)
                         .build()));
     }
