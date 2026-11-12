@@ -11,8 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.Map;
 import java.util.List;
-import java.util.Set;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,7 +61,7 @@ public class Main {
                 .build();
 
         List<ChatCompletionMessageParam> messages = new ArrayList<>();
-        Set<String> openedLspDocuments = new HashSet<>();
+        Map<String, Integer> lspDocumentVersions = new HashMap<>();
         String skillsPrompt = loadSkillsPrompt();
         if (skillsPrompt != null) {
             messages.add(ChatCompletionMessageParam.ofSystem(
@@ -70,11 +69,11 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        addUserMessages(client, lspClient, openedLspDocuments, messages, prompt);
-        System.out.print(runAgentLoop(client, lspClient, openedLspDocuments, messages));
+        addUserMessages(client, lspClient, lspDocumentVersions, messages, prompt);
+        System.out.print(runAgentLoop(client, lspClient, lspDocumentVersions, messages));
     }
 
-    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, List<ChatCompletionMessageParam> messages) {
+    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, List<ChatCompletionMessageParam> messages) {
         while (true) {
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
@@ -120,8 +119,11 @@ public class Main {
                             Files.createDirectories(parent);
                         }
                         Files.writeString(filePath, arguments.content);
+                        if (lspClient != null) {
+                            syncWrittenDocument(lspClient, lspDocumentVersions, filePath);
+                        }
                         result = "File written successfully.";
-                    } catch (java.io.IOException e) {
+                    } catch (Exception e) {
                         throw new RuntimeException("failed to write file: " + arguments.filePath, e);
                     }
                 } else if ("Bash".equals(function.name())) {
@@ -129,11 +131,11 @@ public class Main {
                     result = executeBash(arguments.command);
                 } else if ("Skill".equals(function.name())) {
                     SkillTool arguments = function.arguments(SkillTool.class);
-                    result = invokeSkill(client, lspClient, openedLspDocuments, arguments);
+                    result = invokeSkill(client, lspClient, lspDocumentVersions, arguments);
                 } else if ("LSP".equals(function.name())) {
                     LSPTool arguments = function.arguments(LSPTool.class);
                     try {
-                        result = executeLspTool(lspClient, openedLspDocuments, arguments);
+                        result = executeLspTool(lspClient, lspDocumentVersions, arguments);
                     } catch (Exception e) {
                         throw new RuntimeException("LSP definition lookup failed", e);
                     }
@@ -235,7 +237,7 @@ public class Main {
         return tools;
     }
 
-    private static String executeLspTool(LSPClient lspClient, Set<String> openedDocuments, LSPTool arguments) throws Exception {
+    private static String executeLspTool(LSPClient lspClient, Map<String, Integer> documentVersions, LSPTool arguments) throws Exception {
         if (lspClient == null) {
             return "LSP is not configured";
         }
@@ -244,28 +246,8 @@ public class Main {
         }
 
         Path sourcePath = Path.of(arguments.filePath).toAbsolutePath().normalize();
-        String sourceUri = sourcePath.toUri().toASCIIString();
-        if (!openedDocuments.contains(sourceUri)) {
-            String fileName = sourcePath.getFileName().toString();
-            int extensionStart = fileName.lastIndexOf('.');
-            String extension = extensionStart >= 0 ? fileName.substring(extensionStart) : "";
-            String languageId = lspClient.extensionToLanguage.get(extension);
-            if (languageId == null) {
-                throw new IllegalArgumentException("no language configured for extension: " + extension);
-            }
-
-            String source = Files.readString(sourcePath, StandardCharsets.UTF_8);
-            Map<String, Object> didOpen = Map.of(
-                    "method", "textDocument/didOpen",
-                    "params", Map.of(
-                            "textDocument", Map.of(
-                                    "uri", sourceUri,
-                                    "languageId", languageId,
-                                    "version", 1,
-                                    "text", source)));
-            lspClient.call("notify", JSON_MAPPER.writeValueAsString(didOpen));
-            openedDocuments.add(sourceUri);
-        }
+        String sourceUri = documentUri(sourcePath);
+        ensureDocumentOpen(lspClient, documentVersions, sourcePath);
 
         Map<String, Object> textDocument = Map.of("uri", sourceUri);
         Map<String, Object> position = Map.of(
@@ -288,6 +270,82 @@ public class Main {
             return formatDefinitionResult(result);
         }
         return formatReferencesResult(result);
+    }
+
+    private static void ensureDocumentOpen(LSPClient lspClient, Map<String, Integer> documentVersions, Path filePath) throws Exception {
+        Path absolutePath = filePath.toAbsolutePath().normalize();
+        String uri = documentUri(absolutePath);
+        if (documentVersions.containsKey(uri)) {
+            return;
+        }
+
+        String languageId = languageForPath(lspClient, absolutePath);
+        if (languageId == null) {
+            throw new IllegalArgumentException("no language configured for file: " + absolutePath);
+        }
+        String text = Files.readString(absolutePath, StandardCharsets.UTF_8);
+        Map<String, Object> didOpen = Map.of(
+                "method", "textDocument/didOpen",
+                "params", Map.of(
+                        "textDocument", Map.of(
+                                "uri", uri,
+                                "languageId", languageId,
+                                "version", 1,
+                                "text", text)));
+        lspClient.call("notify", JSON_MAPPER.writeValueAsString(didOpen));
+        documentVersions.put(uri, 1);
+    }
+
+    private static void syncWrittenDocument(LSPClient lspClient, Map<String, Integer> documentVersions, Path filePath) throws Exception {
+        Path absolutePath = filePath.toAbsolutePath().normalize();
+        String languageId = languageForPath(lspClient, absolutePath);
+        if (languageId == null) {
+            return;
+        }
+
+        String uri = documentUri(absolutePath);
+        String savedText = Files.readString(absolutePath, StandardCharsets.UTF_8);
+        Integer previousVersion = documentVersions.get(uri);
+        Map<String, Object> notification;
+        int nextVersion;
+        if (previousVersion == null) {
+            nextVersion = 1;
+            notification = Map.of(
+                    "method", "textDocument/didOpen",
+                    "params", Map.of(
+                            "textDocument", Map.of(
+                                    "uri", uri,
+                                    "languageId", languageId,
+                                    "version", nextVersion,
+                                    "text", savedText)));
+        } else {
+            nextVersion = previousVersion + 1;
+            notification = Map.of(
+                    "method", "textDocument/didChange",
+                    "params", Map.of(
+                            "textDocument", Map.of(
+                                    "uri", uri,
+                                    "version", nextVersion),
+                            "contentChanges", List.of(Map.of("text", savedText))));
+        }
+
+        lspClient.call("notify", JSON_MAPPER.writeValueAsString(notification));
+        documentVersions.put(uri, nextVersion);
+    }
+
+    private static String languageForPath(LSPClient lspClient, Path filePath) {
+        Path fileNamePath = filePath.getFileName();
+        if (fileNamePath == null) {
+            return null;
+        }
+        String fileName = fileNamePath.toString();
+        int extensionStart = fileName.lastIndexOf('.');
+        String extension = extensionStart >= 0 ? fileName.substring(extensionStart) : "";
+        return lspClient.extensionToLanguage.get(extension);
+    }
+
+    private static String documentUri(Path filePath) {
+        return filePath.toAbsolutePath().normalize().toUri().toASCIIString();
     }
 
     private static String formatDefinitionResult(JsonNode location) {
@@ -332,7 +390,7 @@ public class Main {
                 .replace('\\', '/');
     }
 
-    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, SkillTool arguments) {
+    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, SkillTool arguments) {
         Path skillFile = findSkillFile(arguments.name);
         if (skillFile == null) {
             return "Skill not found: " + arguments.name;
@@ -346,7 +404,7 @@ public class Main {
 
         List<ChatCompletionMessageParam> subagentMessages = new ArrayList<>();
         addUserMessage(subagentMessages, body);
-        String answer = runAgentLoop(client, lspClient, openedLspDocuments, subagentMessages);
+        String answer = runAgentLoop(client, lspClient, lspDocumentVersions, subagentMessages);
         return "Skill " + arguments.name + " ran in a separate context and returned: " + answer;
     }
 
@@ -459,7 +517,7 @@ public class Main {
         return metadata;
     }
 
-    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, List<ChatCompletionMessageParam> messages, String prompt) {
+    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
             addUserMessage(messages, prompt);
             return;
@@ -497,7 +555,7 @@ public class Main {
                 SkillTool forkArguments = new SkillTool();
                 forkArguments.name = skillName;
                 forkArguments.args = prompt.substring(tokens.end()).strip();
-                addUserMessage(messages, invokeSkill(client, lspClient, openedLspDocuments, forkArguments));
+                addUserMessage(messages, invokeSkill(client, lspClient, lspDocumentVersions, forkArguments));
                 return;
             }
             skillBodies.add(skill.body());
