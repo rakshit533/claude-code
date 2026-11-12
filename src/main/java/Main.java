@@ -39,6 +39,16 @@ public class Main {
             throw new RuntimeException("OPENROUTER_API_KEY is not set");
         }
 
+        LSPClient lspClient;
+        try {
+            lspClient = LSPClient.fromEnvironment();
+        } catch (Exception e) {
+            throw new RuntimeException("failed to initialize LSP client", e);
+        }
+        if (lspClient != null) {
+            System.err.println("LSP client connected");
+        }
+
         OpenAIClient client = OpenAIOkHttpClient.builder()
                 .apiKey(apiKey)
                 .baseUrl(baseUrl)
@@ -52,11 +62,11 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        addUserMessages(client, messages, prompt);
-        System.out.print(runAgentLoop(client, messages));
+        addUserMessages(client, lspClient, messages, prompt);
+        System.out.print(runAgentLoop(client, lspClient, messages));
     }
 
-    private static String runAgentLoop(OpenAIClient client, List<ChatCompletionMessageParam> messages) {
+    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, List<ChatCompletionMessageParam> messages) {
         while (true) {
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
@@ -64,62 +74,7 @@ public class Main {
                             .messages(messages)
                             .putAdditionalBodyProperty(
                                     "tools",
-                                    JsonValue.from(
-                                            List.of(
-                                                    Map.of(
-                                                            "type", "function",
-                                                            "function", Map.of(
-                                                                    "name", "Read",
-                                                                    "description", "Read and return the contents of a file",
-                                                                    "parameters", Map.of(
-                                                                            "type", "object",
-                                                                            "properties", Map.of(
-                                                                                    "file_path", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "The path to the file to read")),
-                                                                            "required", List.of("file_path")))),
-                                                    Map.of(
-                                                            "type", "function",
-                                                            "function", Map.of(
-                                                                    "name", "Write",
-                                                                    "description", "Write content to a file",
-                                                                    "parameters", Map.of(
-                                                                            "type", "object",
-                                                                            "properties", Map.of(
-                                                                                    "file_path", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "The path of the file to write to"),
-                                                                                    "content", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "The content to write to the file")),
-                                                                            "required", List.of("file_path", "content")))),
-                                                    Map.of(
-                                                            "type", "function",
-                                                            "function", Map.of(
-                                                                    "name", "Bash",
-                                                                    "description", "Execute a shell command",
-                                                                    "parameters", Map.of(
-                                                                            "type", "object",
-                                                                            "properties", Map.of(
-                                                                                    "command", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "The command to execute")),
-                                                                            "required", List.of("command")))),
-                                                    Map.of(
-                                                            "type", "function",
-                                                            "function", Map.of(
-                                                                    "name", "Skill",
-                                                                    "description", "Load a skill's instructions into the conversation",
-                                                                    "parameters", Map.of(
-                                                                            "type", "object",
-                                                                            "properties", Map.of(
-                                                                                    "name", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "The name of the skill to use"),
-                                                                                    "args", Map.of(
-                                                                                            "type", "string",
-                                                                                            "description", "Optional arguments for the skill")),
-                                                                            "required", List.of("name")))))))
+                                    JsonValue.from(toolDefinitions(lspClient)))
                             .build());
             if (response.choices().isEmpty()) {
                 throw new RuntimeException("no choices in response");
@@ -166,7 +121,10 @@ public class Main {
                     result = executeBash(arguments.command);
                 } else if ("Skill".equals(function.name())) {
                     SkillTool arguments = function.arguments(SkillTool.class);
-                    result = invokeSkill(client, arguments);
+                    result = invokeSkill(client, lspClient, arguments);
+                } else if ("LSP".equals(function.name())) {
+                    function.arguments(LSPTool.class);
+                    result = "LSP is not implemented yet";
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
@@ -180,7 +138,92 @@ public class Main {
         }
     }
 
-    private static String invokeSkill(OpenAIClient client, SkillTool arguments) {
+    private static List<Map<String, Object>> toolDefinitions(LSPClient lspClient) {
+        List<Map<String, Object>> tools = new ArrayList<>();
+        tools.add(Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Read",
+                        "description", "Read and return the contents of a file",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "file_path", Map.of(
+                                                "type", "string",
+                                                "description", "The path to the file to read")),
+                                "required", List.of("file_path")))));
+        tools.add(Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Write",
+                        "description", "Write content to a file",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "file_path", Map.of(
+                                                "type", "string",
+                                                "description", "The path of the file to write to"),
+                                        "content", Map.of(
+                                                "type", "string",
+                                                "description", "The content to write to the file")),
+                                "required", List.of("file_path", "content")))));
+        tools.add(Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Bash",
+                        "description", "Execute a shell command",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "command", Map.of(
+                                                "type", "string",
+                                                "description", "The command to execute")),
+                                "required", List.of("command")))));
+        tools.add(Map.of(
+                "type", "function",
+                "function", Map.of(
+                        "name", "Skill",
+                        "description", "Load a skill's instructions into the conversation",
+                        "parameters", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "name", Map.of(
+                                                "type", "string",
+                                                "description", "The name of the skill to use"),
+                                        "args", Map.of(
+                                                "type", "string",
+                                                "description", "Optional arguments for the skill")),
+                                "required", List.of("name")))));
+
+        if (lspClient != null) {
+            tools.add(Map.of(
+                    "type", "function",
+                    "function", Map.of(
+                            "name", "LSP",
+                            "description", "Returns the file, line, and character where a symbol is defined. Line and character are 1-based.",
+                            "parameters", Map.of(
+                                    "type", "object",
+                                    "properties", Map.of(
+                                            "operation", Map.of(
+                                                    "type", "string",
+                                                    "enum", List.of("goToDefinition")),
+                                            "filePath", Map.of(
+                                                    "type", "string",
+                                                    "description", "Absolute path, or a path relative to the agent's current working directory."),
+                                            "line", Map.of(
+                                                    "type", "integer",
+                                                    "minimum", 1,
+                                                    "description", "1-based line number of the symbol."),
+                                            "character", Map.of(
+                                                    "type", "integer",
+                                                    "minimum", 1,
+                                                    "description", "1-based character offset in UTF-16 code units.")),
+                                    "required", List.of("operation", "filePath", "line", "character")))));
+        }
+        return tools;
+    }
+
+    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, SkillTool arguments) {
         Path skillFile = findSkillFile(arguments.name);
         if (skillFile == null) {
             return "Skill not found: " + arguments.name;
@@ -194,7 +237,7 @@ public class Main {
 
         List<ChatCompletionMessageParam> subagentMessages = new ArrayList<>();
         addUserMessage(subagentMessages, body);
-        String answer = runAgentLoop(client, subagentMessages);
+        String answer = runAgentLoop(client, lspClient, subagentMessages);
         return "Skill " + arguments.name + " ran in a separate context and returned: " + answer;
     }
 
@@ -307,7 +350,7 @@ public class Main {
         return metadata;
     }
 
-    private static void addUserMessages(OpenAIClient client, List<ChatCompletionMessageParam> messages, String prompt) {
+    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
             addUserMessage(messages, prompt);
             return;
@@ -345,7 +388,7 @@ public class Main {
                 SkillTool forkArguments = new SkillTool();
                 forkArguments.name = skillName;
                 forkArguments.args = prompt.substring(tokens.end()).strip();
-                addUserMessage(messages, invokeSkill(client, forkArguments));
+                addUserMessage(messages, invokeSkill(client, lspClient, forkArguments));
                 return;
             }
             skillBodies.add(skill.body());
