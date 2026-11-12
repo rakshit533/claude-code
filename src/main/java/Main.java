@@ -19,6 +19,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class Main {
+    private record SkillDocument(String body, Map<String, String> metadata) {}
+
     public static void main(String[] args) {
         if (args.length < 2 || !"-p".equals(args[0])) {
             System.err.println("Usage: program -p <prompt>");
@@ -50,8 +52,11 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        addUserMessages(messages, prompt);
+        addUserMessages(client, messages, prompt);
+        System.out.print(runAgentLoop(client, messages));
+    }
 
+    private static String runAgentLoop(OpenAIClient client, List<ChatCompletionMessageParam> messages) {
         while (true) {
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
@@ -125,8 +130,7 @@ public class Main {
 
             var toolCalls = message.toolCalls();
             if (toolCalls.isEmpty() || toolCalls.get().isEmpty()) {
-                System.out.print(message.content().orElse(""));
-                return;
+                return message.content().orElse("");
             }
 
             for (var toolCall : toolCalls.get()) {
@@ -162,13 +166,7 @@ public class Main {
                     result = executeBash(arguments.command);
                 } else if ("Skill".equals(function.name())) {
                     SkillTool arguments = function.arguments(SkillTool.class);
-                    Path skillFile = findSkillFile(arguments.name);
-                    if (skillFile == null) {
-                        result = "Skill not found: " + arguments.name;
-                    } else {
-                        String body = loadSkillBody(skillFile, arguments.name);
-                        result = substituteSkillArguments(body, arguments.args == null ? "" : arguments.args);
-                    }
+                    result = invokeSkill(client, arguments);
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
@@ -180,6 +178,24 @@ public class Main {
                                 .build()));
             }
         }
+    }
+
+    private static String invokeSkill(OpenAIClient client, SkillTool arguments) {
+        Path skillFile = findSkillFile(arguments.name);
+        if (skillFile == null) {
+            return "Skill not found: " + arguments.name;
+        }
+
+        SkillDocument skill = loadSkill(skillFile, arguments.name);
+        String body = substituteSkillArguments(skill.body(), arguments.args == null ? "" : arguments.args);
+        if (!"fork".equals(skill.metadata().get("context"))) {
+            return body;
+        }
+
+        List<ChatCompletionMessageParam> subagentMessages = new ArrayList<>();
+        addUserMessage(subagentMessages, body);
+        String answer = runAgentLoop(client, subagentMessages);
+        return "Skill " + arguments.name + " ran in a separate context and returned: " + answer;
     }
 
     private static String executeBash(String command) {
@@ -259,7 +275,7 @@ public class Main {
             }
 
             String key = line.substring(0, colon).trim();
-            if (!key.equals("name") && !key.equals("description")) {
+            if (!key.equals("name") && !key.equals("description") && !key.equals("context")) {
                 continue;
             }
 
@@ -291,7 +307,7 @@ public class Main {
         return metadata;
     }
 
-    private static void addUserMessages(List<ChatCompletionMessageParam> messages, String prompt) {
+    private static void addUserMessages(OpenAIClient client, List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
             addUserMessage(messages, prompt);
             return;
@@ -324,7 +340,15 @@ public class Main {
                 arguments = prompt.substring(tokens.start());
                 break;
             }
-            skillBodies.add(loadSkillBody(skillFile, skillName));
+            SkillDocument skill = loadSkill(skillFile, skillName);
+            if ("fork".equals(skill.metadata().get("context"))) {
+                SkillTool arguments = new SkillTool();
+                arguments.name = skillName;
+                arguments.args = prompt.substring(tokens.end()).strip();
+                addUserMessage(messages, invokeSkill(client, arguments));
+                return;
+            }
+            skillBodies.add(skill.body());
         }
 
         if (skillBodies.isEmpty()) {
@@ -343,14 +367,16 @@ public class Main {
                         .build()));
     }
 
-    private static String loadSkillBody(Path skillFile, String skillName) {
+    private static SkillDocument loadSkill(Path skillFile, String skillName) {
         try {
             List<String> lines = Files.readAllLines(skillFile, StandardCharsets.UTF_8);
             int frontmatterEnd = findFrontmatterEnd(lines);
             if (frontmatterEnd < 0) {
                 throw new RuntimeException("skill has invalid frontmatter: " + skillName);
             }
-            return String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
+            Map<String, String> metadata = parseSkillFrontmatter(lines);
+            String body = String.join("\n", lines.subList(frontmatterEnd + 1, lines.size())).strip();
+            return new SkillDocument(body, metadata);
         } catch (java.io.IOException e) {
             throw new RuntimeException("failed to load skill: " + skillName, e);
         }
