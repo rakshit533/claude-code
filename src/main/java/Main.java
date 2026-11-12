@@ -99,7 +99,22 @@ public class Main {
                                                                                     "command", Map.of(
                                                                                             "type", "string",
                                                                                             "description", "The command to execute")),
-                                                                            "required", List.of("command")))))))
+                                                                            "required", List.of("command")))),
+                                                    Map.of(
+                                                            "type", "function",
+                                                            "function", Map.of(
+                                                                    "name", "Skill",
+                                                                    "description", "Load a skill's instructions into the conversation",
+                                                                    "parameters", Map.of(
+                                                                            "type", "object",
+                                                                            "properties", Map.of(
+                                                                                    "name", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "The name of the skill to use"),
+                                                                                    "args", Map.of(
+                                                                                            "type", "string",
+                                                                                            "description", "Optional arguments for the skill")),
+                                                                            "required", List.of("name")))))))
                             .build());
             if (response.choices().isEmpty()) {
                 throw new RuntimeException("no choices in response");
@@ -145,6 +160,15 @@ public class Main {
                 } else if ("Bash".equals(function.name())) {
                     BashTool arguments = function.arguments(BashTool.class);
                     result = executeBash(arguments.command);
+                } else if ("Skill".equals(function.name())) {
+                    SkillTool arguments = function.arguments(SkillTool.class);
+                    Path skillFile = findSkillFile(arguments.name);
+                    if (skillFile == null) {
+                        result = "Skill not found: " + arguments.name;
+                    } else {
+                        String body = loadSkillBody(skillFile, arguments.name);
+                        result = substituteSkillArguments(body, arguments.args == null ? "" : arguments.args);
+                    }
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
@@ -208,7 +232,8 @@ public class Main {
         }
         return "You have access to the following skills:\n\n"
                 + String.join("\n", skillDescriptions)
-                + "\n";
+                + "\n\nIf a skill matches the user's request, call the Skill tool with its name\n"
+                + "and follow the instructions it returns.\n";
     }
 
     private static Map<String, String> parseSkillFrontmatter(List<String> lines) {
@@ -329,6 +354,20 @@ public class Main {
         } catch (java.io.IOException e) {
             throw new RuntimeException("failed to load skill: " + skillName, e);
         }
+    }
+
+    private static Path findSkillFile(String skillName) {
+        if (skillName == null || skillName.isBlank() || skillName.contains("/") || skillName.contains("\\")) {
+            return null;
+        }
+
+        Path skillsDirectory = Path.of(".claude", "skills").toAbsolutePath().normalize();
+        Path skillDirectory = skillsDirectory.resolve(skillName).normalize();
+        if (!skillDirectory.startsWith(skillsDirectory)) {
+            return null;
+        }
+        Path skillFile = skillDirectory.resolve("SKILL.md");
+        return Files.isRegularFile(skillFile) ? skillFile : null;
     }
 
     private static String substituteSkillArguments(String body, String arguments) {
