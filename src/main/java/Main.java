@@ -342,10 +342,10 @@ public class Main {
             }
             SkillDocument skill = loadSkill(skillFile, skillName);
             if ("fork".equals(skill.metadata().get("context"))) {
-                SkillTool arguments = new SkillTool();
-                arguments.name = skillName;
-                arguments.args = prompt.substring(tokens.end()).strip();
-                addUserMessage(messages, invokeSkill(client, arguments));
+                SkillTool forkArguments = new SkillTool();
+                forkArguments.name = skillName;
+                forkArguments.args = prompt.substring(tokens.end()).strip();
+                addUserMessage(messages, invokeSkill(client, forkArguments));
                 return;
             }
             skillBodies.add(skill.body());
