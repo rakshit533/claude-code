@@ -6,13 +6,18 @@ import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessageParam;
 import com.openai.models.chat.completions.ChatCompletionSystemMessageParam;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.Map;
 import java.util.List;
+import java.util.Set;
+import java.util.HashSet;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.nio.charset.StandardCharsets;
+import java.net.URI;
 import java.util.Comparator;
 import java.util.stream.Stream;
 import java.util.regex.Matcher;
@@ -20,6 +25,7 @@ import java.util.regex.Pattern;
 
 public class Main {
     private record SkillDocument(String body, Map<String, String> metadata) {}
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     public static void main(String[] args) {
         if (args.length < 2 || !"-p".equals(args[0])) {
@@ -55,6 +61,7 @@ public class Main {
                 .build();
 
         List<ChatCompletionMessageParam> messages = new ArrayList<>();
+        Set<String> openedLspDocuments = new HashSet<>();
         String skillsPrompt = loadSkillsPrompt();
         if (skillsPrompt != null) {
             messages.add(ChatCompletionMessageParam.ofSystem(
@@ -62,11 +69,11 @@ public class Main {
                             .content(skillsPrompt)
                             .build()));
         }
-        addUserMessages(client, lspClient, messages, prompt);
-        System.out.print(runAgentLoop(client, lspClient, messages));
+        addUserMessages(client, lspClient, openedLspDocuments, messages, prompt);
+        System.out.print(runAgentLoop(client, lspClient, openedLspDocuments, messages));
     }
 
-    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, List<ChatCompletionMessageParam> messages) {
+    private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, List<ChatCompletionMessageParam> messages) {
         while (true) {
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
@@ -121,10 +128,14 @@ public class Main {
                     result = executeBash(arguments.command);
                 } else if ("Skill".equals(function.name())) {
                     SkillTool arguments = function.arguments(SkillTool.class);
-                    result = invokeSkill(client, lspClient, arguments);
+                    result = invokeSkill(client, lspClient, openedLspDocuments, arguments);
                 } else if ("LSP".equals(function.name())) {
-                    function.arguments(LSPTool.class);
-                    result = "LSP is not implemented yet";
+                    LSPTool arguments = function.arguments(LSPTool.class);
+                    try {
+                        result = executeLspTool(lspClient, openedLspDocuments, arguments);
+                    } catch (Exception e) {
+                        throw new RuntimeException("LSP definition lookup failed", e);
+                    }
                 } else {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
@@ -223,7 +234,58 @@ public class Main {
         return tools;
     }
 
-    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, SkillTool arguments) {
+    private static String executeLspTool(LSPClient lspClient, Set<String> openedDocuments, LSPTool arguments) throws Exception {
+        if (lspClient == null) {
+            return "LSP is not configured";
+        }
+        if (!"goToDefinition".equals(arguments.operation)) {
+            return "Unsupported LSP operation: " + arguments.operation;
+        }
+
+        Path sourcePath = Path.of(arguments.filePath).toAbsolutePath().normalize();
+        String sourceUri = sourcePath.toUri().toASCIIString();
+        if (!openedDocuments.contains(sourceUri)) {
+            String fileName = sourcePath.getFileName().toString();
+            int extensionStart = fileName.lastIndexOf('.');
+            String extension = extensionStart >= 0 ? fileName.substring(extensionStart) : "";
+            String languageId = lspClient.extensionToLanguage.get(extension);
+            if (languageId == null) {
+                throw new IllegalArgumentException("no language configured for extension: " + extension);
+            }
+
+            String source = Files.readString(sourcePath, StandardCharsets.UTF_8);
+            Map<String, Object> didOpen = Map.of(
+                    "method", "textDocument/didOpen",
+                    "params", Map.of(
+                            "textDocument", Map.of(
+                                    "uri", sourceUri,
+                                    "languageId", languageId,
+                                    "version", 1,
+                                    "text", source)));
+            lspClient.call("notify", JSON_MAPPER.writeValueAsString(didOpen));
+            openedDocuments.add(sourceUri);
+        }
+
+        Map<String, Object> definitionRequest = Map.of(
+                "method", "textDocument/definition",
+                "params", Map.of(
+                        "textDocument", Map.of("uri", sourceUri),
+                        "position", Map.of(
+                                "line", arguments.line - 1,
+                                "character", arguments.character - 1)));
+        String response = lspClient.call("request", JSON_MAPPER.writeValueAsString(definitionRequest));
+        JsonNode location = JSON_MAPPER.readTree(response);
+        Path targetPath = Path.of(URI.create(location.get("uri").asText())).toAbsolutePath().normalize();
+        JsonNode start = location.path("range").path("start");
+        String relativePath = Path.of("").toAbsolutePath().normalize()
+                .relativize(targetPath)
+                .toString()
+                .replace('\\', '/');
+        return "Defined in " + relativePath + ":" + (start.get("line").asInt() + 1)
+                + ":" + (start.get("character").asInt() + 1);
+    }
+
+    private static String invokeSkill(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, SkillTool arguments) {
         Path skillFile = findSkillFile(arguments.name);
         if (skillFile == null) {
             return "Skill not found: " + arguments.name;
@@ -237,7 +299,7 @@ public class Main {
 
         List<ChatCompletionMessageParam> subagentMessages = new ArrayList<>();
         addUserMessage(subagentMessages, body);
-        String answer = runAgentLoop(client, lspClient, subagentMessages);
+        String answer = runAgentLoop(client, lspClient, openedLspDocuments, subagentMessages);
         return "Skill " + arguments.name + " ran in a separate context and returned: " + answer;
     }
 
@@ -350,7 +412,7 @@ public class Main {
         return metadata;
     }
 
-    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, List<ChatCompletionMessageParam> messages, String prompt) {
+    private static void addUserMessages(OpenAIClient client, LSPClient lspClient, Set<String> openedLspDocuments, List<ChatCompletionMessageParam> messages, String prompt) {
         if (!prompt.startsWith("/")) {
             addUserMessage(messages, prompt);
             return;
@@ -388,7 +450,7 @@ public class Main {
                 SkillTool forkArguments = new SkillTool();
                 forkArguments.name = skillName;
                 forkArguments.args = prompt.substring(tokens.end()).strip();
-                addUserMessage(messages, invokeSkill(client, lspClient, forkArguments));
+                addUserMessage(messages, invokeSkill(client, lspClient, openedLspDocuments, forkArguments));
                 return;
             }
             skillBodies.add(skill.body());
