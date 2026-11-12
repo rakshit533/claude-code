@@ -81,7 +81,17 @@ public class Main {
     }
 
     private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, DiagnosticTracker diagnosticTracker, List<ChatCompletionMessageParam> messages) {
+        LatestToolResult latestToolResult = new LatestToolResult();
         while (true) {
+            try {
+                diagnosticTracker.poll();
+                if (latestToolResult.canAppendDiagnostics() && diagnosticTracker.hasNewDiagnostics()) {
+                    latestToolResult.appendDiagnostics(messages, diagnosticTracker.takeNewDiagnostics());
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("failed to read LSP diagnostics", e);
+            }
+
             ChatCompletion response = client.chat().completions().create(
                     ChatCompletionCreateParams.builder()
                             .model("anthropic/claude-haiku-4.5")
@@ -101,7 +111,9 @@ public class Main {
             if (toolCalls.isEmpty() || toolCalls.get().isEmpty()) {
                 try {
                     diagnosticTracker.poll();
-                    String diagnostics = diagnosticTracker.takeNewDiagnostics();
+                    String diagnostics = diagnosticTracker.hasNewDiagnostics()
+                            ? diagnosticTracker.takeNewDiagnostics()
+                            : "";
                     if (!diagnostics.isEmpty()) {
                         addUserMessage(messages, diagnostics);
                         continue;
@@ -161,24 +173,41 @@ public class Main {
                     throw new RuntimeException("unsupported tool: " + function.name());
                 }
 
-                try {
-                    diagnosticTracker.poll();
-                    if (!isWrite) {
-                        String diagnostics = diagnosticTracker.takeNewDiagnostics();
-                        if (!diagnostics.isEmpty()) {
-                            result += "\n\n" + diagnostics;
-                        }
-                    }
-                } catch (Exception e) {
-                    throw new RuntimeException("failed to read LSP diagnostics", e);
-                }
-
+                int toolMessageIndex = messages.size();
                 messages.add(ChatCompletionMessageParam.ofTool(
                         ChatCompletionToolMessageParam.builder()
                                 .toolCallId(functionCall.id())
                                 .content(result)
                                 .build()));
+                latestToolResult.record(toolMessageIndex, functionCall.id(), result, isWrite);
             }
+        }
+    }
+
+    private static final class LatestToolResult {
+        private int messageIndex = -1;
+        private String toolCallId;
+        private String content;
+        private boolean writeResult;
+
+        private void record(int messageIndex, String toolCallId, String content, boolean writeResult) {
+            this.messageIndex = messageIndex;
+            this.toolCallId = toolCallId;
+            this.content = content;
+            this.writeResult = writeResult;
+        }
+
+        private boolean canAppendDiagnostics() {
+            return messageIndex >= 0 && !writeResult;
+        }
+
+        private void appendDiagnostics(List<ChatCompletionMessageParam> messages, String diagnostics) {
+            content += "\n\n" + diagnostics;
+            ChatCompletionToolMessageParam updatedToolMessage = ChatCompletionToolMessageParam.builder()
+                    .toolCallId(toolCallId)
+                    .content(content)
+                    .build();
+            messages.set(messageIndex, ChatCompletionMessageParam.ofTool(updatedToolMessage));
         }
     }
 
@@ -546,6 +575,10 @@ public class Main {
             }
             pending.clear();
             return output.toString();
+        }
+
+        private boolean hasNewDiagnostics() {
+            return !pending.isEmpty();
         }
 
         private static String severityName(int severity) {
