@@ -82,6 +82,7 @@ public class Main {
 
     private static String runAgentLoop(OpenAIClient client, LSPClient lspClient, Map<String, Integer> lspDocumentVersions, DiagnosticTracker diagnosticTracker, List<ChatCompletionMessageParam> messages) {
         LatestToolResult latestToolResult = new LatestToolResult();
+        boolean hasWrittenInRun = false;
         while (true) {
             try {
                 diagnosticTracker.poll();
@@ -106,11 +107,13 @@ public class Main {
 
             var message = response.choices().get(0).message();
             messages.add(ChatCompletionMessageParam.ofAssistant(message.toParam()));
-
             var toolCalls = message.toolCalls();
             if (toolCalls.isEmpty() || toolCalls.get().isEmpty()) {
                 try {
                     diagnosticTracker.poll();
+                    if (hasWrittenInRun && !diagnosticTracker.hasNewDiagnostics()) {
+                        pollForFinalDiagnostics(diagnosticTracker);
+                    }
                     String diagnostics = diagnosticTracker.hasNewDiagnostics()
                             ? diagnosticTracker.takeNewDiagnostics()
                             : "";
@@ -180,7 +183,25 @@ public class Main {
                                 .content(result)
                                 .build()));
                 latestToolResult.record(toolMessageIndex, functionCall.id(), result, isWrite);
+                hasWrittenInRun |= isWrite;
+
+                try {
+                    // Capture reports between tool calls, but attach them at
+                    // the next request boundary after this batch has recorded
+                    // its latest tool result.
+                    diagnosticTracker.poll();
+                } catch (Exception e) {
+                    throw new RuntimeException("failed to read LSP diagnostics", e);
+                }
             }
+        }
+    }
+
+    private static void pollForFinalDiagnostics(DiagnosticTracker diagnosticTracker) throws Exception {
+        long deadline = System.nanoTime() + 2_000_000_000L;
+        while (!diagnosticTracker.hasNewDiagnostics() && System.nanoTime() < deadline) {
+            Thread.sleep(100);
+            diagnosticTracker.poll();
         }
     }
 
